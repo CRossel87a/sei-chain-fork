@@ -355,6 +355,7 @@ type App struct {
 
 	optimisticProcessingInfo      OptimisticProcessingInfo
 	optimisticProcessingInfoMutex sync.RWMutex
+	optimisticGeneration          uint64
 
 	// batchVerifier *ante.SR25519BatchVerifier
 	txDecoder         sdk.TxDecoder
@@ -1105,6 +1106,36 @@ func (app *App) ClearOptimisticProcessingInfo() {
 	app.optimisticProcessingInfo = OptimisticProcessingInfo{}
 }
 
+func (app *App) startOptimisticProcessing(ctx sdk.Context, txs [][]byte, req BlockProcessRequest, lastCommit abci.CommitInfo) {
+	app.optimisticProcessingInfoMutex.RLock()
+	myGeneration := app.optimisticProcessingInfo.Generation
+	app.optimisticProcessingInfoMutex.RUnlock()
+
+	go func() {
+		events, txResults, endBlockResp, processErr := app.ProcessBlock(ctx, txs, req, lastCommit, false)
+
+		app.optimisticProcessingInfoMutex.Lock()
+		if app.optimisticProcessingInfo.Generation != myGeneration {
+			app.optimisticProcessingInfoMutex.Unlock()
+			ctx.Logger().Info("Optimistic processing superseded, discarding results", "myGeneration", myGeneration)
+			return
+		}
+		if processErr != nil {
+			ctx.Logger().Info("ProcessBlock failed in optimistic processing", "error", processErr)
+			app.optimisticProcessingInfo.Aborted = true
+		} else {
+			app.optimisticProcessingInfo.Events = events
+			app.optimisticProcessingInfo.TxRes = txResults
+			app.optimisticProcessingInfo.EndBlockResp = endBlockResp
+		}
+		completion := app.optimisticProcessingInfo.Completion
+		app.optimisticProcessingInfoMutex.Unlock()
+		if completion != nil {
+			completion <- struct{}{}
+		}
+	}()
+}
+
 func (app *App) ProcessProposalHandler(ctx sdk.Context, req *abci.RequestProcessProposal) (resp *abci.ResponseProcessProposal, err error) {
 	// TODO: this check decodes transactions which is redone in subsequent processing. We might be able to optimize performance
 	// by recording the decoding results and avoid decoding again later on.
@@ -1119,11 +1150,13 @@ func (app *App) ProcessProposalHandler(ctx sdk.Context, req *abci.RequestProcess
 	app.optimisticProcessingInfoMutex.Lock()
 	shouldStartOptimisticProcessing := app.optimisticProcessingInfo.Completion == nil
 	if shouldStartOptimisticProcessing {
+		app.optimisticGeneration++
 		completionSignal := make(chan struct{}, 1)
 		app.optimisticProcessingInfo = OptimisticProcessingInfo{
 			Height:     req.Height,
 			Hash:       req.Hash,
 			Completion: completionSignal,
+			Generation: app.optimisticGeneration,
 		}
 	}
 	app.optimisticProcessingInfoMutex.Unlock()
@@ -1138,33 +1171,12 @@ func (app *App) ProcessProposalHandler(ctx sdk.Context, req *abci.RequestProcess
 			app.optimisticProcessingInfoMutex.Unlock()
 			completion <- struct{}{}
 		} else {
-			go func() {
-				// ProcessBlock has panic recovery and returns error for any processing failures
-				// All panics (including GetSigners) are handled in ProcessBlock, not affecting proposal acceptance
-				events, txResults, endBlockResp, processErr := app.ProcessBlock(ctx, req.Txs, req, req.ProposedLastCommit, false)
-
-				app.optimisticProcessingInfoMutex.Lock()
-				if processErr != nil {
-					// ProcessBlock failed (including GetSigners panics), mark as aborted
-					app.Logger().Info("ProcessBlock failed in optimistic processing", "error", processErr)
-					app.optimisticProcessingInfo.Aborted = true
-				} else {
-					// ProcessBlock succeeded, store results
-					app.optimisticProcessingInfo.Events = events
-					app.optimisticProcessingInfo.TxRes = txResults
-					app.optimisticProcessingInfo.EndBlockResp = endBlockResp
-				}
-				completion := app.optimisticProcessingInfo.Completion
-				app.optimisticProcessingInfoMutex.Unlock()
-				completion <- struct{}{}
-			}()
+			app.startOptimisticProcessing(ctx, req.Txs, req, req.ProposedLastCommit)
 		}
 	} else {
 		// Optimistic processing already running, check if hash matches
 		if !bytes.Equal(app.GetOptimisticProcessingInfo().Hash, req.Hash) {
-			app.optimisticProcessingInfoMutex.Lock()
-			app.optimisticProcessingInfo.Aborted = true
-			app.optimisticProcessingInfoMutex.Unlock()
+			app.handleRoundChange(ctx, req)
 		}
 	}
 
@@ -1173,6 +1185,38 @@ func (app *App) ProcessProposalHandler(ctx sdk.Context, req *abci.RequestProcess
 	}
 
 	return resp, nil
+}
+
+func (app *App) handleRoundChange(ctx sdk.Context, req *abci.RequestProcessProposal) {
+	app.optimisticProcessingInfoMutex.RLock()
+	oldCompletion := app.optimisticProcessingInfo.Completion
+	app.optimisticProcessingInfoMutex.RUnlock()
+
+	select {
+	case <-oldCompletion:
+		// Old goroutine finished. Restart optimistic processing for the new round.
+		ctx.Logger().Info("Round change: old optimistic processing completed, restarting")
+		app.GetBaseApp().RefreshProcessProposalState()
+
+		app.optimisticProcessingInfoMutex.Lock()
+		app.optimisticGeneration++
+		completionSignal := make(chan struct{}, 1)
+		app.optimisticProcessingInfo = OptimisticProcessingInfo{
+			Height:     req.Height,
+			Hash:       req.Hash,
+			Completion: completionSignal,
+			Generation: app.optimisticGeneration,
+		}
+		app.optimisticProcessingInfoMutex.Unlock()
+
+		app.startOptimisticProcessing(ctx, req.Txs, req, req.ProposedLastCommit)
+	default:
+		// Old goroutine still running. Fall back to abort.
+		ctx.Logger().Info("Round change: old optimistic processing still running, aborting")
+		app.optimisticProcessingInfoMutex.Lock()
+		app.optimisticProcessingInfo.Aborted = true
+		app.optimisticProcessingInfoMutex.Unlock()
+	}
 }
 
 func (app *App) FinalizeBlocker(ctx sdk.Context, req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {

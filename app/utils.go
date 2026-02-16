@@ -11,6 +11,7 @@ type OptimisticProcessingInfo struct {
 	Hash       []byte
 	Aborted    bool
 	Completion chan struct{}
+	Generation uint64
 	// result fields
 	Events       []abci.Event
 	TxRes        []*abci.ExecTxResult
