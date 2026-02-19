@@ -610,17 +610,6 @@ func (app *BaseApp) setProcessProposalState(header tmproto.Header) {
 	app.processProposalState.SetContext(ctx)
 }
 
-func (app *BaseApp) RefreshProcessProposalState() {
-	if app.processProposalState == nil {
-		return
-	}
-	ms := app.cms.CacheMultiStore()
-	header := app.processProposalState.Context().BlockHeader()
-	ctx := sdk.NewContext(ms, header, false, app.logger)
-	app.processProposalState.SetMultiStore(ms)
-	app.processProposalState.SetContext(ctx)
-}
-
 func (app *BaseApp) resetStatesExceptCheckState() {
 	app.prepareProposalState = nil
 	app.processProposalState = nil

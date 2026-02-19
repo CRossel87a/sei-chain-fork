@@ -23,7 +23,6 @@ import (
 
 const SleepInterval = 5 * time.Second
 const NewHeadsListenerBuffer = 10
-const LogListenerBuffer = 100 // Buffer for block heights to process
 
 type SubscriptionAPI struct {
 	tmClient            rpcclient.Client
@@ -33,16 +32,7 @@ type SubscriptionAPI struct {
 	logFetcher          *LogFetcher
 	newHeadListenersMtx *sync.RWMutex
 	newHeadListeners    map[rpc.ID]chan map[string]interface{}
-	logListenersMtx     *sync.RWMutex
-	logListeners        map[rpc.ID]*logSubscription
 	connectionType      ConnectionType
-}
-
-type logSubscription struct {
-	filter         *filters.FilterCriteria
-	notifier       *rpc.Notifier
-	blockHeightsCh chan int64 // Channel to receive new block heights
-	doneCh         chan struct{}
 }
 
 type SubscriptionConfig struct {
@@ -59,8 +49,6 @@ func NewSubscriptionAPI(tmClient rpcclient.Client, k *keeper.Keeper, ctxProvider
 		logFetcher:          logFetcher,
 		newHeadListenersMtx: &sync.RWMutex{},
 		newHeadListeners:    make(map[rpc.ID]chan map[string]interface{}),
-		logListenersMtx:     &sync.RWMutex{},
-		logListeners:        make(map[rpc.ID]*logSubscription),
 		connectionType:      connectionType,
 	}
 	id, subCh, err := api.subscriptionManager.Subscribe(context.Background(), NewHeadQueryBuilder(), api.subscriptonConfig.subscriptionCapacity)
@@ -68,6 +56,7 @@ func NewSubscriptionAPI(tmClient rpcclient.Client, k *keeper.Keeper, ctxProvider
 		panic(err)
 	}
 	go func() {
+		defer recoverAndLog()
 		defer func() {
 			_ = api.subscriptionManager.Unsubscribe(context.Background(), id)
 		}()
@@ -81,8 +70,6 @@ func NewSubscriptionAPI(tmClient rpcclient.Client, k *keeper.Keeper, ctxProvider
 				fmt.Printf("error encoding new head event %#v due to %s\n", res.Data, err)
 				continue
 			}
-
-			// Handle newHeads subscriptions
 			api.newHeadListenersMtx.Lock()
 			toDelete := []rpc.ID{}
 			for id, c := range api.newHeadListeners {
@@ -94,18 +81,6 @@ func NewSubscriptionAPI(tmClient rpcclient.Client, k *keeper.Keeper, ctxProvider
 				delete(api.newHeadListeners, id)
 			}
 			api.newHeadListenersMtx.Unlock()
-
-			// Handle logs subscriptions - non-blocking dispatch
-			api.logListenersMtx.RLock()
-			for _, logSub := range api.logListeners {
-				select {
-				case logSub.blockHeightsCh <- eventHeader.Header.Height:
-					// Successfully queued
-				default:
-					// Buffer full, subscriber not keeping up - skip this block for this subscriber
-				}
-			}
-			api.logListenersMtx.RUnlock()
 		}
 	}()
 	return api
@@ -125,63 +100,8 @@ func handleListener(c chan map[string]interface{}, ethHeader map[string]interfac
 	}
 }
 
-// runLogSubscription runs in a separate goroutine for each log subscription,
-// processing block heights from its channel without blocking the main event loop.
-func (a *SubscriptionAPI) runLogSubscription(logSub *logSubscription, subscriptionID rpc.ID) {
-	defer func() {
-		if r := recover(); r != nil {
-			// Log panic but don't crash
-		}
-	}()
-
-	var currentBlockHeight int64
-
-	for {
-		select {
-		case <-logSub.doneCh:
-			return
-		case newBlockHeight, ok := <-logSub.blockHeightsCh:
-			if !ok {
-				return
-			}
-
-			// Skip if this block is not newer than our current position
-			if newBlockHeight <= currentBlockHeight {
-				continue
-			}
-
-			// Check if we've hit ToBlock limit
-			if logSub.filter.ToBlock != nil && logSub.filter.ToBlock.Int64() >= 0 && newBlockHeight > logSub.filter.ToBlock.Int64() {
-				return
-			}
-
-			// Create a filter for just this block
-			blockFilter := *logSub.filter
-			blockFilter.FromBlock = big.NewInt(newBlockHeight)
-			blockFilter.ToBlock = big.NewInt(newBlockHeight)
-
-			// Fetch logs for this specific block
-			logs, _, err := a.logFetcher.GetLogsByFilters(context.Background(), blockFilter, 0)
-			if err != nil {
-				// Keep subscription alive despite error
-				continue
-			}
-
-			// Send matching logs to the subscriber
-			for _, log := range logs {
-				if err := logSub.notifier.Notify(subscriptionID, log); err != nil {
-					return // Subscription closed
-				}
-			}
-
-			// Update our position
-			currentBlockHeight = newBlockHeight
-		}
-	}
-}
-
 func (a *SubscriptionAPI) NewHeads(ctx context.Context) (s *rpc.Subscription, err error) {
-	defer recordMetrics("eth_newHeads", a.connectionType, time.Now())
+	defer recordMetricsWithError("eth_newHeads", a.connectionType, time.Now(), err)
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
 		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
@@ -197,6 +117,7 @@ func (a *SubscriptionAPI) NewHeads(ctx context.Context) (s *rpc.Subscription, er
 	a.newHeadListeners[rpcSub.ID] = listener
 
 	go func() {
+		defer recoverAndLog()
 	OUTER:
 		for {
 			select {
@@ -222,26 +143,42 @@ func (a *SubscriptionAPI) NewHeads(ctx context.Context) (s *rpc.Subscription, er
 }
 
 func (a *SubscriptionAPI) Logs(ctx context.Context, filter *filters.FilterCriteria) (s *rpc.Subscription, err error) {
-	defer recordMetrics("eth_logs", a.connectionType, time.Now())
-
+	defer recordMetricsWithError("eth_logs", a.connectionType, time.Now(), err)
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
 		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
 	}
-
-	// Create empty filter if none provided
+	// create empty filter if filter does not exist
 	if filter == nil {
 		filter = &filters.FilterCriteria{}
+	}
+	// when fromBlock is 0 and toBlock is latest, adjust the filter
+	// to unbounded filter
+	if filter.FromBlock != nil && filter.FromBlock.Int64() == 0 &&
+		filter.ToBlock != nil && filter.ToBlock.Int64() < 0 {
+		latest := big.NewInt(a.logFetcher.ctxProvider(LatestCtxHeight).BlockHeight())
+		unboundedFilter := &filters.FilterCriteria{
+			FromBlock: latest, // set to latest block height
+			ToBlock:   nil,    // set to nil to continue listening
+			Addresses: filter.Addresses,
+			Topics:    filter.Topics,
+		}
+		filter = unboundedFilter
 	}
 
 	rpcSub := notifier.CreateSubscription()
 
-	// If BlockHash is specified, this is a request for a specific block's logs only
+	// Track subscription metrics
+	wpMetrics := GetGlobalMetrics()
+	wpMetrics.RecordSubscriptionStart()
+
 	if filter.BlockHash != nil {
 		go func() {
-			defer func() { _ = recover() }()
+			defer recoverAndLog()
+			defer wpMetrics.RecordSubscriptionEnd()
 			logs, _, err := a.logFetcher.GetLogsByFilters(ctx, *filter, 0)
 			if err != nil {
+				wpMetrics.RecordSubscriptionError()
 				_ = notifier.Notify(rpcSub.ID, err)
 				return
 			}
@@ -254,68 +191,29 @@ func (a *SubscriptionAPI) Logs(ctx context.Context, filter *filters.FilterCriter
 		return rpcSub, nil
 	}
 
-	// Create log subscription with buffered channel
-	logSub := &logSubscription{
-		filter:         filter,
-		notifier:       notifier,
-		blockHeightsCh: make(chan int64, LogListenerBuffer),
-		doneCh:         make(chan struct{}),
-	}
-
-	a.logListenersMtx.Lock()
-	if uint64(len(a.logListeners)) >= a.subscriptonConfig.newHeadLimit {
-		a.logListenersMtx.Unlock()
-		return nil, errors.New("no new subscription can be created")
-	}
-	a.logListeners[rpcSub.ID] = logSub
-	a.logListenersMtx.Unlock()
-
-	// Start the log processing goroutine
-	go a.runLogSubscription(logSub, rpcSub.ID)
-
-	// Handle historical logs if FromBlock is set
-	if filter.FromBlock != nil && filter.FromBlock.Int64() >= 0 {
-		clone := *filter
-		currentHeight := a.logFetcher.ctxProvider(LatestCtxHeight).BlockHeight()
-		if filter.ToBlock == nil || filter.ToBlock.Int64() < 0 {
-			clone.ToBlock = big.NewInt(currentHeight)
-		}
-
-		go func() {
-			defer func() { _ = recover() }()
-			logs, _, err := a.logFetcher.GetLogsByFilters(ctx, clone, 0)
+	go func() {
+		defer recoverAndLog()
+		defer wpMetrics.RecordSubscriptionEnd()
+		begin := int64(0)
+		for {
+			logs, lastToHeight, err := a.logFetcher.GetLogsByFilters(ctx, *filter, begin)
 			if err != nil {
+				wpMetrics.RecordSubscriptionError()
 				_ = notifier.Notify(rpcSub.ID, err)
 				return
 			}
 			for _, log := range logs {
-				select {
-				case <-rpcSub.Err():
+				if err := notifier.Notify(rpcSub.ID, log); err != nil {
 					return
-				default:
-					if err := notifier.Notify(rpcSub.ID, log); err != nil {
-						return
-					}
 				}
 			}
-		}()
-	}
-
-	// Monitor subscription and clean up when it ends
-	go func() {
-		defer func() { _ = recover() }()
-		<-rpcSub.Err()
-
-		// Signal the log processing goroutine to stop
-		close(logSub.doneCh)
-
-		// Remove from listeners map
-		a.logListenersMtx.Lock()
-		delete(a.logListeners, rpcSub.ID)
-		a.logListenersMtx.Unlock()
-
-		// Close the block heights channel
-		close(logSub.blockHeightsCh)
+			if filter.ToBlock != nil && lastToHeight >= filter.ToBlock.Int64() {
+				return
+			}
+			begin = lastToHeight
+			filter.FromBlock = big.NewInt(lastToHeight + 1)
+			time.Sleep(SleepInterval)
+		}
 	}()
 
 	return rpcSub, nil
@@ -390,13 +288,13 @@ func encodeTmHeader(
 	for _, txRes := range header.ResultFinalizeBlock.TxResults {
 		gasWanted += txRes.GasUsed
 	}
-	gasLimit := uint64(header.ResultFinalizeBlock.ConsensusParamUpdates.Block.MaxGas)
+	gasLimit := uint64(header.ResultFinalizeBlock.ConsensusParamUpdates.Block.MaxGas) //nolint:gosec
 	result := map[string]interface{}{
 		"difficulty":            (*hexutil.Big)(utils.Big0), // inapplicable to Sei
 		"extraData":             hexutil.Bytes{},            // inapplicable to Sei
 		"gasLimit":              hexutil.Uint64(gasLimit),
-		"gasUsed":               hexutil.Uint64(gasWanted),
-		"logsBloom":             ethtypes.Bloom{}, // inapplicable to Sei
+		"gasUsed":               hexutil.Uint64(gasWanted), //nolint:gosec
+		"logsBloom":             ethtypes.Bloom{},          // inapplicable to Sei
 		"miner":                 miner,
 		"nonce":                 ethtypes.BlockNonce{}, // inapplicable to Sei
 		"number":                (*hexutil.Big)(number),
@@ -404,7 +302,7 @@ func encodeTmHeader(
 		"receiptsRoot":          resultHash,
 		"sha3Uncles":            common.Hash{}, // inapplicable to Sei
 		"stateRoot":             appHash,
-		"timestamp":             hexutil.Uint64(header.Header.Time.Unix()),
+		"timestamp":             hexutil.Uint64(header.Header.Time.Unix()), //nolint:gosec
 		"transactionsRoot":      txHash,
 		"mixHash":               common.Hash{},     // inapplicable to Sei
 		"excessBlobGas":         hexutil.Uint64(0), // inapplicable to Sei
