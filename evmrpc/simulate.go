@@ -562,63 +562,48 @@ func (b *Backend) SuggestGasTipCap(context.Context) (*big.Int, error) {
 }
 
 func (b *Backend) getBlockHeight(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (int64, bool, error) {
-	var (
-		block         *coretypes.ResultBlock
-		err           error
-		isLatestBlock bool
-	)
-
 	if blockNrOrHash.BlockHash != nil {
-		block, err = blockByHashRespectingWatermarks(ctx, b.tmClient, b.watermarks, blockNrOrHash.BlockHash[:], 1)
+		block, err := blockByHashRespectingWatermarks(ctx, b.tmClient, b.watermarks, blockNrOrHash.BlockHash[:], 1)
 		if err != nil {
 			return 0, false, err
 		}
 		return block.Block.Height, false, nil
 	}
 
-	var blockNumberPtr *int64
 	if blockNrOrHash.BlockNumber != nil {
-		blockNumberPtr, err = getBlockNumber(ctx, b.tmClient, *blockNrOrHash.BlockNumber)
+		blockNumberPtr, err := getBlockNumber(ctx, b.tmClient, *blockNrOrHash.BlockNumber)
 		if err != nil {
 			return 0, false, err
 		}
-		if blockNumberPtr == nil {
-			isLatestBlock = true
+		if blockNumberPtr != nil {
+			// Specific block number requested
+			return *blockNumberPtr, false, nil
 		}
-	} else {
-		isLatestBlock = true
 	}
-	block, err = blockByNumberRespectingWatermarks(ctx, b.tmClient, b.watermarks, blockNumberPtr, 1)
+
+	// Latest block — just use cached watermark height, no Block RPC needed
+	latest, err := b.watermarks.LatestHeight(ctx)
 	if err != nil {
 		return 0, false, err
 	}
-	return block.Block.Height, isLatestBlock, nil
+	return latest, true, nil
 }
 
 func (b *Backend) getHeader(blockNumber *big.Int) *ethtypes.Header {
 	zeroExcessBlobGas := uint64(0)
 	baseFee := b.keeper.GetNextBaseFeePerGas(b.ctxProvider(blockNumber.Int64() - 1)).TruncateInt().BigInt()
-	ctx := b.ctxProvider(blockNumber.Int64())
-	if ctx.ChainID() == "pacific-1" && ctx.BlockHeight() < b.keeper.UpgradeKeeper().GetDoneHeight(ctx.WithGasMeter(sdk.NewInfiniteGasMeter(1, 1)), "6.2.0") {
+	sdkCtx := b.ctxProvider(blockNumber.Int64())
+	if sdkCtx.ChainID() == "pacific-1" && sdkCtx.BlockHeight() < b.keeper.UpgradeKeeper().GetDoneHeight(sdkCtx.WithGasMeter(sdk.NewInfiniteGasMeter(1, 1)), "6.2.0") {
 		baseFee = nil
 	}
-	// Get block results to access consensus parameters
+
+	// Use default gas limit directly — ConsensusParamUpdates is nil on most blocks,
+	// so the old code was doing a Block RPC + BlockResults RPC (with 1s retry sleep)
+	// just to fall back to this default nearly every time.
+	gasLimit := uint64(keeper.DefaultBlockGasLimit)
+
 	number := blockNumber.Int64()
-	block, blockErr := blockByNumberRespectingWatermarks(context.Background(), b.tmClient, b.watermarks, &number, 1)
-	var gasLimit uint64
-	if blockErr == nil {
-		// Try to get consensus parameters from block results
-		blockRes, blockResErr := blockResultsWithRetry(context.Background(), b.tmClient, &number)
-		if blockResErr == nil && blockRes.ConsensusParamUpdates != nil && blockRes.ConsensusParamUpdates.Block != nil {
-			gasLimit = uint64(blockRes.ConsensusParamUpdates.Block.MaxGas) //nolint:gosec
-		} else {
-			// Fallback to default if block results unavailable
-			gasLimit = keeper.DefaultBlockGasLimit
-		}
-	} else {
-		// Fallback to default if block unavailable
-		gasLimit = keeper.DefaultBlockGasLimit
-	}
+	block, blockErr := blockByNumberWithRetry(context.Background(), b.tmClient, &number, 0)
 
 	header := &ethtypes.Header{
 		Difficulty:    common.Big0,
@@ -629,7 +614,6 @@ func (b *Backend) getHeader(blockNumber *big.Int) *ethtypes.Header {
 		ExcessBlobGas: &zeroExcessBlobGas,
 	}
 
-	//TODO: what should happen if an err occurs here?
 	if blockErr == nil {
 		header.ParentHash = common.BytesToHash(block.BlockID.Hash)
 		header.Time = toUint64(block.Block.Time.Unix())

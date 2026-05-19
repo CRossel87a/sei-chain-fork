@@ -84,11 +84,10 @@ func (s *SendAPI) SendRawTransaction(ctx context.Context, input hexutil.Bytes) (
 	if err != nil {
 		return
 	}
-	gasUsedEstimate, err := s.simulateTx(ctx, tx)
-	if err != nil {
-		tx, _ = msg.AsTransaction()
-		gasUsedEstimate = tx.Gas() // if issue simulating, fallback to gas limit
-	}
+	// MEV hot path: skip on-send gas simulation (DoEstimateGas binary-searches the EVM,
+	// adding 5-50ms per tx). SetGasEstimate is only a hint for block builders; using
+	// tx.Gas() is the same value the error-fallback path uses.
+	gasUsedEstimate := tx.Gas()
 	txBuilder := s.txConfigProvider(LatestCtxHeight).NewTxBuilder()
 	if err = txBuilder.SetMsgs(msg); err != nil {
 		return
