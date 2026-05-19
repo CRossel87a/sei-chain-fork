@@ -1062,6 +1062,114 @@ func (f *LogFetcher) normalizeRangeQueryLogs(ctx context.Context, candidateLogs 
 	return rebuilt, nil
 }
 
+// GetLogsForBlockDirect fetches logs for a single known-available block height,
+// bypassing all watermark checks. Used by subscription handlers where the block
+// height comes from a just-received NewBlockHeader event.
+func (f *LogFetcher) GetLogsForBlockDirect(ctx context.Context, height int64, crit filters.FilterCriteria) ([]*ethtypes.Log, error) {
+	block, err := blockByNumberWithRetry(ctx, f.tmClient, &height, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	return f.collectLogsFast(block, crit), nil
+}
+
+// collectLogsFast is a streamlined log-emit path for the subscription hot loop.
+// It bypasses filterTransactions (which does ECDSA sender recovery, per-sender
+// nonce bookkeeping, and multiple historical ctxProvider builds that the log
+// emit path does not need) and instead walks the block's raw tx bytes directly.
+//
+// Preserved: receipt-based filtering (missing/ante-error/synthetic), bloom
+// pre-check, MatchesCriteria, cumulative log index across the block.
+//
+// Not preserved vs. collectLogs: corner-case suppression of failed zero-gas-price
+// nonce-not-bumping txs. Those txs rarely emit logs in practice, and never emit
+// the logs an MEV subscriber cares about.
+func (f *LogFetcher) collectLogsFast(block *coretypes.ResultBlock, crit filters.FilterCriteria) []*ethtypes.Log {
+	blockHeight := block.Block.Height
+	// LatestCtxHeight returns the check-state context — metadata-only, no
+	// CacheMultiStoreWithVersion load. isReceiptFromAnteError only reads
+	// ChainID / ClosestUpgradeName off it, and keeper.GetReceipt goes through
+	// the receipt store's in-memory cache regardless of ctx version.
+	ctx := f.ctxProvider(LatestCtxHeight)
+	txConfig := f.txConfigProvider(blockHeight)
+	blockHash := common.BytesToHash(block.BlockID.Hash)
+
+	hasFilters := len(crit.Addresses) != 0 || len(crit.Topics) != 0
+	var filterIndexes [][]BloomIndexes
+	if hasFilters {
+		filterIndexes = EncodeFilters(crit.Addresses, crit.Topics)
+	}
+
+	var logs []*ethtypes.Log
+	var logIndex uint
+	emittedTxIdx := uint(0)
+
+	for _, txBytes := range block.Block.Txs {
+		sdkTx, err := txConfig.TxDecoder()(txBytes)
+		if err != nil {
+			continue
+		}
+		for _, msg := range sdkTx.GetMsgs() {
+			evmMsg, ok := msg.(*evmtypes.MsgEVMTransaction)
+			if !ok {
+				continue
+			}
+			if evmMsg.IsAssociateTx() {
+				continue
+			}
+			ethtx, _ := evmMsg.AsTransaction()
+			txHash := ethtx.Hash()
+
+			rcpt, rerr := f.k.GetReceipt(ctx, txHash)
+			if rerr != nil {
+				continue
+			}
+			if rcpt.BlockNumber != uint64(blockHeight) || isReceiptFromAnteError(ctx, rcpt) { //nolint:gosec // blockHeight validated non-negative
+				continue
+			}
+			if !f.includeSyntheticReceipts && rcpt.TxType == evmtypes.ShellEVMTxType {
+				continue
+			}
+
+			// Preserve the txIdx semantics of the existing collectLogs path: the
+			// index counts only txs that survive filtering, not the absolute
+			// position in block.Block.Txs.
+			currentTxIdx := emittedTxIdx
+			emittedTxIdx++
+
+			if hasFilters && len(rcpt.LogsBloom) > 0 && !MatchFilters(ethtypes.Bloom(rcpt.LogsBloom), filterIndexes) {
+				logIndex += uint(len(rcpt.Logs))
+				continue
+			}
+
+			for _, log := range rcpt.Logs {
+				ethLog := &ethtypes.Log{
+					Address:     common.HexToAddress(log.Address),
+					Data:        log.Data,
+					BlockNumber: uint64(blockHeight), //nolint:gosec // blockHeight validated non-negative
+					TxHash:      txHash,
+					TxIndex:     currentTxIdx,
+					BlockHash:   blockHash,
+					Index:       logIndex,
+					Removed:     false,
+				}
+				ethLog.Topics = make([]common.Hash, len(log.Topics))
+				for i, topic := range log.Topics {
+					ethLog.Topics[i] = common.HexToHash(topic)
+				}
+				logIndex++
+
+				if !MatchesCriteria(ethLog, crit) {
+					continue
+				}
+				logs = append(logs, ethLog)
+			}
+		}
+	}
+	return logs
+}
+
 // Pooled version that reuses slice allocation
 func (f *LogFetcher) GetLogsForBlockPooled(block *coretypes.ResultBlock, crit filters.FilterCriteria, result *[]*ethtypes.Log) {
 	collector := &pooledCollector{logs: result}

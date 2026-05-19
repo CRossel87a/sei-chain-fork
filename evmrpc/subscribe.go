@@ -32,7 +32,15 @@ type SubscriptionAPI struct {
 	logFetcher          *LogFetcher
 	newHeadListenersMtx *sync.RWMutex
 	newHeadListeners    map[rpc.ID]chan map[string]interface{}
+	logListenersMtx     *sync.RWMutex
+	logListeners        map[rpc.ID]*logSubscription
 	connectionType      ConnectionType
+}
+
+type logSubscription struct {
+	filter             *filters.FilterCriteria
+	notifier           *rpc.Notifier
+	currentBlockHeight int64
 }
 
 type SubscriptionConfig struct {
@@ -49,6 +57,8 @@ func NewSubscriptionAPI(tmClient rpcclient.Client, k *keeper.Keeper, ctxProvider
 		logFetcher:          logFetcher,
 		newHeadListenersMtx: &sync.RWMutex{},
 		newHeadListeners:    make(map[rpc.ID]chan map[string]interface{}),
+		logListenersMtx:     &sync.RWMutex{},
+		logListeners:        make(map[rpc.ID]*logSubscription),
 		connectionType:      connectionType,
 	}
 	id, subCh, err := api.subscriptionManager.Subscribe(context.Background(), NewHeadQueryBuilder(), api.subscriptonConfig.subscriptionCapacity)
@@ -70,6 +80,7 @@ func NewSubscriptionAPI(tmClient rpcclient.Client, k *keeper.Keeper, ctxProvider
 				fmt.Printf("error encoding new head event %#v due to %s\n", res.Data, err)
 				continue
 			}
+			// Handle newHeads subscriptions
 			api.newHeadListenersMtx.Lock()
 			toDelete := []rpc.ID{}
 			for id, c := range api.newHeadListeners {
@@ -81,6 +92,19 @@ func NewSubscriptionAPI(tmClient rpcclient.Client, k *keeper.Keeper, ctxProvider
 				delete(api.newHeadListeners, id)
 			}
 			api.newHeadListenersMtx.Unlock()
+
+			// Handle logs subscriptions
+			api.logListenersMtx.Lock()
+			logToDelete := []rpc.ID{}
+			for id, logSub := range api.logListeners {
+				if !api.handleLogListener(logSub, id, eventHeader.Header.Height) {
+					logToDelete = append(logToDelete, id)
+				}
+			}
+			for _, id := range logToDelete {
+				delete(api.logListeners, id)
+			}
+			api.logListenersMtx.Unlock()
 		}
 	}()
 	return api
@@ -98,6 +122,38 @@ func handleListener(c chan map[string]interface{}, ethHeader map[string]interfac
 		close(c)
 		return false
 	}
+}
+
+func (a *SubscriptionAPI) handleLogListener(logSub *logSubscription, subscriptionID rpc.ID, newBlockHeight int64) bool {
+	defer func() { _ = recover() }()
+
+	// Skip if this block is not newer than our current position
+	if newBlockHeight <= logSub.currentBlockHeight {
+		return true
+	}
+
+	// Check if we've hit ToBlock limit
+	if logSub.filter.ToBlock != nil && logSub.filter.ToBlock.Int64() >= 0 && newBlockHeight > logSub.filter.ToBlock.Int64() {
+		return false // Remove this subscription
+	}
+
+	// Fetch logs directly, bypassing watermark checks (block just arrived, guaranteed available)
+	logs, err := a.logFetcher.GetLogsForBlockDirect(context.Background(), newBlockHeight, *logSub.filter)
+	if err != nil {
+		return true // Keep subscription alive despite error
+	}
+
+	// Send matching logs to the subscriber
+	for _, log := range logs {
+		if err := logSub.notifier.Notify(subscriptionID, log); err != nil {
+			return false // Remove subscription on notification error
+		}
+	}
+
+	// Update our position
+	logSub.currentBlockHeight = newBlockHeight
+
+	return true
 }
 
 func (a *SubscriptionAPI) NewHeads(ctx context.Context) (s *rpc.Subscription, err error) {
@@ -143,42 +199,26 @@ func (a *SubscriptionAPI) NewHeads(ctx context.Context) (s *rpc.Subscription, er
 }
 
 func (a *SubscriptionAPI) Logs(ctx context.Context, filter *filters.FilterCriteria) (s *rpc.Subscription, err error) {
-	defer recordMetricsWithError("eth_logs", a.connectionType, time.Now(), err)
+	defer recordMetrics("eth_logs", a.connectionType, time.Now())
+
 	notifier, supported := rpc.NotifierFromContext(ctx)
 	if !supported {
 		return &rpc.Subscription{}, rpc.ErrNotificationsUnsupported
 	}
-	// create empty filter if filter does not exist
+
+	// Create empty filter if none provided
 	if filter == nil {
 		filter = &filters.FilterCriteria{}
-	}
-	// when fromBlock is 0 and toBlock is latest, adjust the filter
-	// to unbounded filter
-	if filter.FromBlock != nil && filter.FromBlock.Int64() == 0 &&
-		filter.ToBlock != nil && filter.ToBlock.Int64() < 0 {
-		latest := big.NewInt(a.logFetcher.ctxProvider(LatestCtxHeight).BlockHeight())
-		unboundedFilter := &filters.FilterCriteria{
-			FromBlock: latest, // set to latest block height
-			ToBlock:   nil,    // set to nil to continue listening
-			Addresses: filter.Addresses,
-			Topics:    filter.Topics,
-		}
-		filter = unboundedFilter
 	}
 
 	rpcSub := notifier.CreateSubscription()
 
-	// Track subscription metrics
-	wpMetrics := GetGlobalMetrics()
-	wpMetrics.RecordSubscriptionStart()
-
+	// If BlockHash is specified, this is a request for a specific block's logs only
 	if filter.BlockHash != nil {
 		go func() {
-			defer recoverAndLog()
-			defer wpMetrics.RecordSubscriptionEnd()
+			defer func() { _ = recover() }()
 			logs, _, err := a.logFetcher.GetLogsByFilters(ctx, *filter, 0)
 			if err != nil {
-				wpMetrics.RecordSubscriptionError()
 				_ = notifier.Notify(rpcSub.ID, err)
 				return
 			}
@@ -191,29 +231,65 @@ func (a *SubscriptionAPI) Logs(ctx context.Context, filter *filters.FilterCriter
 		return rpcSub, nil
 	}
 
-	go func() {
-		defer recoverAndLog()
-		defer wpMetrics.RecordSubscriptionEnd()
-		begin := int64(0)
-		for {
-			logs, lastToHeight, err := a.logFetcher.GetLogsByFilters(ctx, *filter, begin)
+	// Determine starting block height
+	var currentBlockHeight int64
+	if filter.FromBlock != nil && filter.FromBlock.Int64() > 0 {
+		currentBlockHeight = filter.FromBlock.Int64()
+	} else {
+		// Start from current block height if FromBlock not specified
+		currentBlockHeight = a.logFetcher.ctxProvider(LatestCtxHeight).BlockHeight()
+	}
+
+	// Add to logs listeners map
+	logSub := &logSubscription{
+		filter:             filter,
+		notifier:           notifier,
+		currentBlockHeight: currentBlockHeight,
+	}
+
+	a.logListenersMtx.Lock()
+	if uint64(len(a.logListeners)) >= a.subscriptonConfig.newHeadLimit {
+		a.logListenersMtx.Unlock()
+		return nil, errors.New("no new subscription can be created")
+	}
+	a.logListeners[rpcSub.ID] = logSub
+	a.logListenersMtx.Unlock()
+
+	// Handle historical logs if FromBlock is set
+	if filter.FromBlock != nil && filter.FromBlock.Int64() >= 0 {
+		clone := *filter
+		if filter.ToBlock == nil || filter.ToBlock.Int64() < 0 {
+			clone.ToBlock = big.NewInt(a.logFetcher.ctxProvider(LatestCtxHeight).BlockHeight())
+		}
+
+		go func() {
+			defer func() { _ = recover() }()
+			logs, _, err := a.logFetcher.GetLogsByFilters(ctx, clone, 0)
 			if err != nil {
-				wpMetrics.RecordSubscriptionError()
 				_ = notifier.Notify(rpcSub.ID, err)
 				return
 			}
 			for _, log := range logs {
-				if err := notifier.Notify(rpcSub.ID, log); err != nil {
+				select {
+				case <-rpcSub.Err():
 					return
+				default:
+					if err := notifier.Notify(rpcSub.ID, log); err != nil {
+						return
+					}
 				}
 			}
-			if filter.ToBlock != nil && lastToHeight >= filter.ToBlock.Int64() {
-				return
-			}
-			begin = lastToHeight
-			filter.FromBlock = big.NewInt(lastToHeight + 1)
-			time.Sleep(SleepInterval)
-		}
+		}()
+	}
+
+	// Monitor subscription and clean up when it ends
+	go func() {
+		defer func() {
+			a.logListenersMtx.Lock()
+			delete(a.logListeners, rpcSub.ID)
+			a.logListenersMtx.Unlock()
+		}()
+		<-rpcSub.Err()
 	}()
 
 	return rpcSub, nil

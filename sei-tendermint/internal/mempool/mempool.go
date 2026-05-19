@@ -299,6 +299,11 @@ func (txmp *TxMempool) CheckTx(
 	cb func(*abci.ResponseCheckTx),
 	txInfo TxInfo,
 ) error {
+	// Reject transactions from peers — only accept local submissions
+	if txInfo.SenderNodeID != "" {
+		return errors.New("peer transactions rejected: local-only mempool")
+	}
+
 	txmp.mtx.RLock()
 	defer txmp.mtx.RUnlock()
 

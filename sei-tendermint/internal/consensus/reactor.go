@@ -298,7 +298,7 @@ func (r *Reactor) sendNewRoundStepMessage(peerID types.NodeID) {
 }
 
 func (r *Reactor) updateRoundStateRoutine(ctx context.Context) error {
-	t := time.NewTicker(100 * time.Microsecond)
+	t := time.NewTicker(100 * time.Millisecond)
 	for {
 		if _, err := utils.Recv(ctx, t.C); err != nil {
 			return err
@@ -387,40 +387,20 @@ OUTER_LOOP:
 					Part:   rs.ProposalBlockParts.GetPart(index),
 				}), ps.peerID)
 				ps.SetHasProposalBlockPart(prs.Height, prs.Round, index)
+				time.Sleep(500 * time.Millisecond)
 				continue OUTER_LOOP
 			}
 		}
 
-		// if the peer is on a previous height that we have, help catch up
-		blockStoreBase := r.state.blockStore.Base()
-		if blockStoreBase > 0 && 0 < prs.Height && prs.Height < rs.Height && prs.Height >= blockStoreBase {
-
-			// If we never received the commit message from the peer, the block parts
-			// will not be initialized.
-			if prs.ProposalBlockParts == nil {
-				blockMeta := r.state.blockStore.LoadBlockMeta(prs.Height)
-				if blockMeta == nil {
-					logger.Error(
-						"failed to load block meta",
-						"height", prs.Height,
-						"blockstoreBase", blockStoreBase,
-						"blockstoreHeight", r.state.blockStore.Height(),
-					)
-				} else {
-					ps.InitProposalBlockParts(blockMeta.BlockID.PartSetHeader)
-				}
-
-				// Continue the loop since prs is a copy and not effected by this
-				// initialization.
-				continue OUTER_LOOP
-			}
-
-			r.gossipDataForCatchup(rs, prs, ps)
+		// Skip catchup gossip — non-validator node does not need to serve block data to peers
+		if 0 < prs.Height && prs.Height < rs.Height {
+			time.Sleep(500 * time.Millisecond)
 			continue OUTER_LOOP
 		}
 
 		// if height and round don't match, sleep
 		if (rs.Height != prs.Height) || (rs.Round != prs.Round) {
+			time.Sleep(500 * time.Millisecond)
 			continue OUTER_LOOP
 		}
 
@@ -555,6 +535,7 @@ func (r *Reactor) gossipVotesRoutine(ctx context.Context, ps *PeerState) error {
 		// if height matches, then send LastCommit, Prevotes, and Precommits
 		if rs.Height == prs.Height {
 			if r.gossipVotesForHeight(rs, prs, ps) {
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 		}
@@ -563,26 +544,15 @@ func (r *Reactor) gossipVotesRoutine(ctx context.Context, ps *PeerState) error {
 		if prs.Height != 0 && rs.Height == prs.Height+1 {
 			if r.pickSendVote(ps, rs.LastCommit) {
 				logger.Debug("picked rs.LastCommit to send", "height", prs.Height)
+				time.Sleep(500 * time.Millisecond)
 				continue
 			}
 		}
 
-		// catchup logic -- if peer is lagging by more than 1, send Commit
-		blockStoreBase := r.state.blockStore.Base()
-
-		if blockStoreBase > 0 && prs.Height != 0 && rs.Height >= prs.Height+2 && prs.Height >= blockStoreBase {
-			// Load the block's extended commit for prs.Height, which contains precommit
-			// signatures for prs.Height.
-			r.state.mtx.RLock()
-			ec := r.state.blockStore.LoadBlockCommit(prs.Height)
-			r.state.mtx.RUnlock()
-			if ec == nil {
-				continue
-			}
-			if r.pickSendVote(ps, ec) {
-				logger.Debug("picked Catchup commit to send", "height", prs.Height)
-				continue
-			}
+		// Skip catchup commit gossip — non-validator node does not need to serve commits to peers
+		if prs.Height != 0 && rs.Height >= prs.Height+2 {
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 
 		timer.Reset(r.state.config.PeerGossipSleepDuration)
@@ -636,21 +606,7 @@ func (r *Reactor) queryMaj23Routine(ctx context.Context, ps *PeerState) error {
 			}
 		}
 
-		// Little point sending LastCommitRound/LastCommit, these are fleeting and
-		// non-blocking.
-		if prs.CatchupCommitRound != -1 && prs.Height > 0 {
-			if prs.Height <= r.state.blockStore.Height() && prs.Height >= r.state.blockStore.Base() {
-				// maybe send Height/CatchupCommitRound/CatchupCommit
-				if commit := r.state.LoadCommit(prs.Height); commit != nil {
-					stateCh.Send(MsgToProto(&VoteSetMaj23Message{
-						Height:  prs.Height,
-						Round:   commit.Round,
-						Type:    tmproto.PrecommitType,
-						BlockID: commit.BlockID,
-					}), ps.peerID)
-				}
-			}
-		}
+		// Skip catchup commit query — non-validator node does not need to serve commits to peers
 		if err := utils.Sleep(ctx, r.state.config.PeerQueryMaj23SleepDuration); err != nil {
 			return err
 		}
